@@ -6,6 +6,8 @@ import {
   SlashCommandBuilder,
   ChatInputCommandInteraction,
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   StringSelectMenuBuilder,
   ComponentType,
   EmbedBuilder,
@@ -303,10 +305,60 @@ client.on('interactionCreate', async (interaction) => {
       const mapEmbeds = buildMapStatsEmbeds(details);
 
       // Show result embed + first map inline; rest in follow-up
-      await i.editReply({ content: '', embeds: [resultEmbed], components: [] });
-      for (const mapEmbed of mapEmbeds) {
-        await interaction.followUp({ embeds: [mapEmbed], ephemeral: false });
-      }
+      const statsComponents = (index: number) =>
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId('stats-prev')
+            .setLabel('Previous')
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(index === 0),
+          new ButtonBuilder()
+            .setCustomId('stats-page')
+            .setLabel(`${index + 1}/${mapEmbeds.length}`)
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(true),
+          new ButtonBuilder()
+            .setCustomId('stats-next')
+            .setLabel('Next')
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(index === mapEmbeds.length - 1)
+        );
+
+      let currentIndex = 0;
+      const statsMessage = await i.editReply({
+        content: '',
+        embeds: [resultEmbed, mapEmbeds[currentIndex]],
+        components: [statsComponents(currentIndex)],
+      });
+
+      const buttonCollector = statsMessage.createMessageComponentCollector({
+        componentType: ComponentType.Button,
+        time: 120000,
+      });
+
+      buttonCollector.on('collect', async (buttonInteraction) => {
+        if (buttonInteraction.user.id !== interaction.user.id) {
+          return buttonInteraction.reply({ content: "These aren't your buttons!", ephemeral: true });
+        }
+
+        await buttonInteraction.deferUpdate();
+
+        if (buttonInteraction.customId === 'stats-prev' && currentIndex > 0) {
+          currentIndex -= 1;
+        }
+        if (buttonInteraction.customId === 'stats-next' && currentIndex < mapEmbeds.length - 1) {
+          currentIndex += 1;
+        }
+
+        await buttonInteraction.editReply({
+          embeds: [resultEmbed, mapEmbeds[currentIndex]],
+          components: [statsComponents(currentIndex)],
+        });
+      });
+
+      buttonCollector.on('end', async () => {
+        await statsMessage.edit({ components: [] }).catch(() => {});
+      });
     });
 
     collector.on('end', (collected) => {

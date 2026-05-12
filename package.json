@@ -19,10 +19,11 @@
     "discord.js": "^14.26.4",
     "dotenv": "^17.4.2",
     "node-cron": "^4.2.1",
-    "pg": "^8.20.0"
+    "pg": "^8.20.0",
+    "playwright": "^1.60.0"
   },
   "devDependencies": {
-    "@types/node": "^25.6.2",
+    "@types/node": "^25.7.0",
     "@types/node-cron": "^3.0.11",
     "prisma": "^7.8.0",
     "ts-node": "^10.9.2",

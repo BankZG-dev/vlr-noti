@@ -34,9 +34,16 @@ export function buildUpcomingWarningEmbed(match: MatchSummary): EmbedBuilder {
 // ---------------------------------------------------------------------------
 // Post-match result embed (overall score)
 // ---------------------------------------------------------------------------
+function parseScore(value: string): [number, number] | null {
+  const normalized = value.replace(/\u2013/g, '-').replace(/\s+/g, ' ').trim();
+  const match = normalized.match(/(\d+)\s*[-–]\s*(\d+)/);
+  if (!match) return null;
+  return [parseInt(match[1], 10), parseInt(match[2], 10)];
+}
+
 function getMapWinner(map: MapResult, team1: string, team2: string): string {
-  const parts = map.score.split('-').map((item) => parseInt(item.trim(), 10));
-  if (parts.length !== 2 || parts.some(Number.isNaN)) return 'Unknown';
+  const parts = parseScore(map.score);
+  if (!parts) return 'Unknown';
   const [score1, score2] = parts;
   if (score1 > score2) return team1;
   if (score2 > score1) return team2;
@@ -49,6 +56,9 @@ function parseStatNumber(value: string): number {
 }
 
 function comparePlayerStats(a: PlayerStat, b: PlayerStat): number {
+  const aRating = parseStatNumber(a.rating);
+  const bRating = parseStatNumber(b.rating);
+  if (aRating !== bRating) return aRating - bRating;
   const aAcs = parseStatNumber(a.acs);
   const bAcs = parseStatNumber(b.acs);
   if (aAcs !== bAcs) return aAcs - bAcs;
@@ -67,23 +77,31 @@ function findMapMVP(players: PlayerStat[]): PlayerStat | null {
   }, null);
 }
 
-function findOverallMVP(details: MatchDetails): PlayerStat | null {
-  const totals = new Map<string, { stat: PlayerStat; acs: number; kills: number; adr: number }>();
+function findOverallMVP(details: MatchDetails): { stat: PlayerStat; rating: number } | null {
+  if (details.allMapsStats) {
+    const allPlayers = [...details.allMapsStats.team1Stats, ...details.allMapsStats.team2Stats];
+    const winner = findMapMVP(allPlayers);
+    return winner ? { stat: winner, rating: parseStatNumber(winner.rating) } : null;
+  }
+
+  const totals = new Map<string, { stat: PlayerStat; rating: number; acs: number; kills: number; adr: number }>();
   const addStats = (player: PlayerStat) => {
     const name = player.name;
+    const rating = parseStatNumber(player.rating);
     const acs = parseStatNumber(player.acs);
     const kills = parseStatNumber(player.kills);
     const adr = parseStatNumber(player.adr);
     const existing = totals.get(name);
     if (existing) {
       totals.set(name, {
-        stat: player,
+        stat: existing.stat,
+        rating: existing.rating + rating,
         acs: existing.acs + acs,
         kills: existing.kills + kills,
         adr: existing.adr + adr,
       });
     } else {
-      totals.set(name, { stat: player, acs, kills, adr });
+      totals.set(name, { stat: player, rating, acs, kills, adr });
     }
   };
 
@@ -92,10 +110,14 @@ function findOverallMVP(details: MatchDetails): PlayerStat | null {
     map.team2Stats.forEach(addStats);
   });
 
-  let best: { stat: PlayerStat; acs: number; kills: number; adr: number } | null = null;
+  let best: { stat: PlayerStat; rating: number; acs: number; kills: number; adr: number } | null = null;
   for (const value of totals.values()) {
     if (!best) {
       best = value;
+      continue;
+    }
+    if (value.rating !== best.rating) {
+      best = value.rating > best.rating ? value : best;
       continue;
     }
     if (value.acs !== best.acs) {
@@ -110,7 +132,7 @@ function findOverallMVP(details: MatchDetails): PlayerStat | null {
       best = value.adr > best.adr ? value : best;
     }
   }
-  return best?.stat ?? null;
+  return best ? { stat: best.stat, rating: best.rating } : null;
 }
 
 function formatOrdinal(index: number): string {
@@ -120,16 +142,83 @@ function formatOrdinal(index: number): string {
   return `${index}th`;
 }
 
+function buildMapLabel(name: string, index: number): string {
+  const trimmed = name.trim();
+  if (/^(\d+|\d+(st|nd|rd|th))\b/.test(trimmed)) {
+    return trimmed;
+  }
+  return `${formatOrdinal(index + 1)} ${trimmed}`;
+}
+
+function getTeamAbbrev(teamName: string): string {
+  // Common team abbreviations
+  const commonAbbrevs: Record<string, string> = {
+    'Full Sense': 'FS',
+    'NRG': 'NRG',
+    'T1': 'T1',
+    'Team Liquid': 'TL',
+    'Cloud9': 'C9',
+    'Sentinels': 'SEN',
+    '100 Thieves': '100T',
+    'G2 Esports': 'G2',
+    'Fnatic': 'FNC',
+    'FURIA': 'FUR',
+    'Leviatán': 'LEV',
+    'Loud': 'LOUD',
+    'KRÜ': 'KRÜ',
+    'MIBR': 'MBR',
+    'EDward Gaming': 'EDG',
+    'FunPlus Phoenix': 'FPX',
+    'Titan': 'TT',
+    'Rex Regum Qeon': 'RRQ',
+    'Global Esports': 'GE',
+    'DetonatioN FocusMe': 'DFM',
+    'ZETA DIVISION': 'ZETA',
+    'Bleed': 'BLD',
+    'DRX': 'DRX',
+    'Gen.G': 'GEN',
+    'Natus Vincere': 'NAVI',
+    'Paper Rex': 'PRX',
+    'Team Secret': 'TS',
+    'Trace Esports': 'TRACE',
+    'BOOM Esports': 'BOOM',
+    'Talon Esports': 'TALON',
+  };
+
+  if (commonAbbrevs[teamName]) return commonAbbrevs[teamName];
+
+  // Fallback: take first 2-3 letters, avoiding common words
+  const words = teamName.split(' ');
+  if (words.length === 1) {
+    return words[0].substring(0, 3).toUpperCase();
+  }
+
+  // For multi-word names, take first letter of each word
+  const abbrev = words.slice(0, 3).map(word => word.charAt(0)).join('').toUpperCase();
+  return abbrev.length <= 3 ? abbrev : abbrev.substring(0, 3);
+}
+
+function extractFirstNumber(value: string): string {
+  const match = value.match(/(\d+(?:\.\d+)?)/);
+  return match ? match[1] : '0';
+}
+
 export function buildResultEmbed(details: MatchDetails, matchUrl: string): EmbedBuilder {
   const winnerName = getMapWinner({ name: 'Final', score: `${details.score1}-${details.score2}`, team1Stats: [], team2Stats: [] }, details.team1, details.team2);
   const overallMvp = findOverallMVP(details);
-  const overallMvpText = overallMvp ? `${overallMvp.name} (${parseStatNumber(overallMvp.acs).toFixed(2)} Rating)` : 'N/A';
+  const overallMvpText = overallMvp ? `${overallMvp.stat.name} (${overallMvp.rating.toFixed(2)} Rating)` : 'N/A';
   const embedColor = winnerName === details.team1 ? VLR_GREEN : winnerName === details.team2 ? VLR_RED : VLR_GREY;
 
   const mapLines = details.maps
     .map((m: MapResult, index) => {
-      const winner = getMapWinner(m, details.team1, details.team2);
-      return `**${formatOrdinal(index + 1)} ${m.name}** — ${winner}`;
+      const scoreParts = parseScore(m.score);
+      if (!scoreParts) return `Map ${buildMapLabel(m.name, index)}: Unknown`;
+
+      const [score1, score2] = scoreParts;
+      const team1Abbrev = getTeamAbbrev(details.team1);
+      const team2Abbrev = getTeamAbbrev(details.team2);
+
+      return `Map ${buildMapLabel(m.name, index)}: ${team1Abbrev} ${score1} - ${score2} ${team2Abbrev}`;
     })
     .join('\n\n');
 
@@ -153,48 +242,85 @@ export function buildResultEmbed(details: MatchDetails, matchUrl: string): Embed
 // ---------------------------------------------------------------------------
 function statTable(players: PlayerStat[]): string {
   if (players.length === 0) return '_No data_';
-  const header = '`Player         | Rating | ACS  | K/D/A   | HS%`';
+  const header = '`Player         | Rating | ACS  | K/D/A   | HS% | FK | FD`';
   const rows = players.map((p) => {
     const name = p.name.length > 12 ? `${p.name.slice(0, 12)}…` : p.name.padEnd(12);
-    const rating = parseStatNumber(p.acs).toFixed(2).padStart(5);
-    const acs = parseStatNumber(p.acs).toFixed(2).padStart(5);
-    const kda = `${p.kills}/${p.deaths}/${p.assists}`.padEnd(7);
-    const hs = p.hsPercent.replace(/[^\d\.]/g, '').padStart(3);
-    return `\`${name} | ${rating} | ${acs} | ${kda} | ${hs}%\``;
+    const rating = parseStatNumber(p.rating).toFixed(2).padStart(5);
+    const acsValue = parseStatNumber(p.acs);
+    const acs = Number.isFinite(acsValue) ? acsValue.toFixed(0).padStart(5) : '    0';
+    const kda = p.kda || `${extractFirstNumber(p.kills)}/${extractFirstNumber(p.deaths)}/${extractFirstNumber(p.assists)}`.padEnd(7);
+    const hs = extractFirstNumber(p.hsPercent).padStart(3);
+    const fk = extractFirstNumber(p.fk).padStart(2);
+    const fd = extractFirstNumber(p.fd).padStart(2);
+    return `\`${name} | ${rating} | ${acs} | ${kda} | ${hs}% | ${fk} | ${fd}\``;
   });
   return [header, ...rows].join('\n');
 }
 
 export function buildMapStatsEmbeds(details: MatchDetails): EmbedBuilder[] {
-  return details.maps.map((map: MapResult) => {
+  const embeds: EmbedBuilder[] = [];
+
+  if (details.allMapsStats) {
+    const mvp = findMapMVP([...details.allMapsStats.team1Stats, ...details.allMapsStats.team2Stats]);
+    const mvpText = mvp ? `${mvp.name} — ${parseStatNumber(mvp.rating).toFixed(2)} Rating` : 'N/A';
+
+    embeds.push(
+      new EmbedBuilder()
+        .setColor(VLR_GREY)
+        .setTitle('🗺️ All Maps')
+        .addFields(
+          {
+            name: details.team1,
+            value: statTable(details.allMapsStats.team1Stats),
+            inline: false,
+          },
+          {
+            name: details.team2,
+            value: statTable(details.allMapsStats.team2Stats),
+            inline: false,
+          },
+          {
+            name: 'Match MVP',
+            value: mvpText,
+            inline: false,
+          }
+        )
+    );
+  }
+
+  details.maps.forEach((map: MapResult) => {
     const winner = getMapWinner(map, details.team1, details.team2);
     const mapColor = winner === details.team1 ? VLR_GREEN : winner === details.team2 ? VLR_RED : VLR_GREY;
     const team1Label = winner === details.team1 ? `✅ ${details.team1}` : details.team1;
     const team2Label = winner === details.team2 ? `✅ ${details.team2}` : details.team2;
     const mvp = findMapMVP([...map.team1Stats, ...map.team2Stats]);
-    const mvpText = mvp ? `${mvp.name} — ${parseStatNumber(mvp.acs).toFixed(2)} Rating` : 'N/A';
+    const mvpText = mvp ? `${mvp.name} — ${parseStatNumber(mvp.rating).toFixed(2)} Rating` : 'N/A';
 
-    return new EmbedBuilder()
-      .setColor(mapColor)
-      .setTitle(`🗺️ ${map.name} — ${winner}`)
-      .addFields(
-        {
-          name: team1Label,
-          value: statTable(map.team1Stats),
-          inline: false,
-        },
-        {
-          name: team2Label,
-          value: statTable(map.team2Stats),
-          inline: false,
-        },
-        {
-          name: 'Map MVP',
-          value: mvpText,
-          inline: false,
-        }
-      );
+    embeds.push(
+      new EmbedBuilder()
+        .setColor(mapColor)
+        .setTitle(`🗺️ ${map.name} — ${winner}`)
+        .addFields(
+          {
+            name: team1Label,
+            value: statTable(map.team1Stats),
+            inline: false,
+          },
+          {
+            name: team2Label,
+            value: statTable(map.team2Stats),
+            inline: false,
+          },
+          {
+            name: 'Map MVP',
+            value: mvpText,
+            inline: false,
+          }
+        )
+    );
   });
+
+  return embeds;
 }
 
 // ---------------------------------------------------------------------------

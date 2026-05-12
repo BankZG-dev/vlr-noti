@@ -1,6 +1,7 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { Element } from 'domhandler';
+import { chromium, Browser, Page } from 'playwright';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -19,16 +20,18 @@ export interface MatchSummary {
 
 export interface PlayerStat {
   name: string;
-  agent: string;
+  agent?: string;
+  rating: string;
   acs: string;
+  kda: string;
   kills: string;
   deaths: string;
   assists: string;
-  kastPct: string;
   adr: string;
   hsPercent: string;
   fk: string;
   fd: string;
+  plusMinus?: string;
 }
 
 export interface MapResult {
@@ -46,6 +49,10 @@ export interface MatchDetails {
   status: string;
   event: string;
   maps: MapResult[];
+  allMapsStats?: {
+    team1Stats: PlayerStat[];
+    team2Stats: PlayerStat[];
+  };
 }
 
 export interface TournamentStage {
@@ -59,6 +66,15 @@ export interface TournamentStage {
 
 const BASE = 'https://www.vlr.gg';
 
+let browserInstance: Browser | null = null;
+
+async function getBrowser(): Promise<Browser> {
+  if (!browserInstance) {
+    browserInstance = await chromium.launch({ headless: true });
+  }
+  return browserInstance;
+}
+
 async function fetchPage(url: string): Promise<cheerio.CheerioAPI | null> {
   try {
     const { data } = await axios.get(url, {
@@ -71,6 +87,21 @@ async function fetchPage(url: string): Promise<cheerio.CheerioAPI | null> {
     return cheerio.load(data);
   } catch (err) {
     console.error(`[scraper] Failed to fetch ${url}:`, err);
+    return null;
+  }
+}
+
+async function fetchPageWithBrowser(url: string): Promise<cheerio.CheerioAPI | null> {
+  try {
+    const browser = await getBrowser();
+    const page = await browser.newPage();
+    await page.goto(url, { waitUntil: 'networkidle' });
+    await page.waitForTimeout(2000); // Wait for JS to render
+    const content = await page.content();
+    await page.close();
+    return cheerio.load(content);
+  } catch (err) {
+    console.error(`[scraper] Failed to fetch with browser ${url}:`, err);
     return null;
   }
 }
@@ -181,28 +212,127 @@ export async function getTeamUpcoming(teamSearch: string): Promise<MatchSummary[
 // ---------------------------------------------------------------------------
 
 function getCellValue(cell: cheerio.Cheerio<Element>): string {
-  return normalizeText(cell.text()).split(/\s+/)[0] || '';
+  return normalizeText(cell.text());
 }
 
-function parsePlayerRow($: cheerio.CheerioAPI, el: Element): PlayerStat {
-  const cells = $(el).find('td');
+function getCellText(cell: cheerio.Cheerio<Element>): string {
+  return normalizeText(cell.text());
+}
+
+function parseScore(value: string): [number, number] | null {
+  const score = normalizeText(value).replace(/\u2013/g, '-');
+  const match = score.match(/(\d+)\s*[-–]\s*(\d+)/);
+  if (!match) return null;
+  return [parseInt(match[1], 10), parseInt(match[2], 10)];
+}
+
+type StatColumns = {
+  player: number;
+  agent: number;
+  rating: number;
+  acs: number;
+  kda: number;
+  kills: number;
+  deaths: number;
+  assists: number;
+  adr: number;
+  hsPercent: number;
+  fk: number;
+  fd: number;
+  plusMinus: number;
+};
+
+function normalizeHeader(text: string): string {
+  return normalizeText(text).toLowerCase().replace('%', ' percent');
+}
+
+function findHeaderIndex(headers: string[], patterns: RegExp[]): number | undefined {
+  return headers.findIndex((header) => patterns.some((pattern) => pattern.test(header)));
+}
+
+function buildStatColumns(headers: string[]): StatColumns {
+  // VLR stat table columns in order: R | ACS | K | D | A | +/– | KAST | ADR | HS% | FK | FD | +/–
+  // Player name is in row text, agent is in img
   return {
-    name: normalizeText($(cells[0]).find('.text-of').text()) || normalizeText($(cells[0]).text()),
-    agent: $(cells[1]).find('img').attr('alt') || '',
-    acs: normalizeText($(cells[2]).text()),
-    kills: normalizeText($(cells[3]).text()),
-    deaths: normalizeText($(cells[4]).text()),
-    assists: normalizeText($(cells[5]).text()),
-    kastPct: normalizeText($(cells[6]).text()),
-    adr: normalizeText($(cells[7]).text()),
-    hsPercent: normalizeText($(cells[8]).text()),
-    fk: normalizeText($(cells[9]).text()),
-    fd: normalizeText($(cells[10]).text()),
+    player: -1, // Extracted from row text
+    agent: -1,  // Extracted from img
+    rating: 0,  // R
+    acs: 1,     // ACS
+    kda: -1,    // Computed from K/D/A
+    kills: 2,   // K
+    deaths: 3,  // D
+    assists: 4, // A
+    adr: 7,     // ADR
+    hsPercent: 8, // HS%
+    fk: 9,      // FK
+    fd: 10,     // FD
+    plusMinus: 5, // +/– first occurrence
+  };
+}
+
+function parsePlayerRow(
+  $: cheerio.CheerioAPI,
+  el: Element,
+  columns: StatColumns
+): PlayerStat {
+  const cells = $(el).find('td');
+
+  // Get player name - try different approaches
+  let playerName = '';
+  if (columns.player >= 0) {
+    const nameCell = cells.eq(columns.player);
+    playerName = normalizeText(nameCell.find('.text-of').text());
+    if (!playerName) {
+      playerName = normalizeText(nameCell.text());
+    }
+  } else {
+    // Player name might be in the row header or first cell
+    playerName = normalizeText($(el).find('th').text()) || normalizeText(cells.eq(0).text());
+  }
+
+  // Get agent
+  let agent = '';
+  if (columns.agent >= 0) {
+    agent = cells.eq(columns.agent).find('img').attr('alt') || '';
+  } else {
+    // Agent might be in an img in the row
+    agent = $(el).find('img').attr('alt') || '';
+  }
+
+  // Extract stats using column mapping
+  const rating = columns.rating >= 0 ? getCellText(cells.eq(columns.rating)) : '0';
+  const acs = columns.acs >= 0 ? getCellText(cells.eq(columns.acs)) : '0';
+  const kills = columns.kills >= 0 ? getCellText(cells.eq(columns.kills)) : '0';
+  const deaths = columns.deaths >= 0 ? getCellText(cells.eq(columns.deaths)) : '0';
+  const assists = columns.assists >= 0 ? getCellText(cells.eq(columns.assists)) : '0';
+  const adr = columns.adr >= 0 ? getCellText(cells.eq(columns.adr)) : '0';
+  const hsPercent = columns.hsPercent >= 0 ? getCellText(cells.eq(columns.hsPercent)) : '0';
+  const fk = columns.fk >= 0 ? getCellText(cells.eq(columns.fk)) : '0';
+  const fd = columns.fd >= 0 ? getCellText(cells.eq(columns.fd)) : '0';
+  const plusMinus = columns.plusMinus >= 0 ? getCellText(cells.eq(columns.plusMinus)) : '';
+
+  const kda = `${kills}/${deaths}/${assists}`;
+
+  return {
+    name: playerName,
+    agent,
+    rating,
+    acs,
+    kda,
+    kills,
+    deaths,
+    assists,
+    adr,
+    hsPercent,
+    fk,
+    fd,
+    plusMinus,
   };
 }
 
 export async function getMatchDetails(matchUrl: string): Promise<MatchDetails | null> {
-  const $ = await fetchPage(matchUrl);
+  // Use browser for JS-rendered stats pages
+  const $ = await fetchPageWithBrowser(matchUrl);
   if (!$) return null;
 
   const team1 = normalizeText($('.match-header-link-name').eq(0).text());
@@ -221,41 +351,72 @@ export async function getMatchDetails(matchUrl: string): Promise<MatchDetails | 
 
   // Per-map stats
   const maps: MapResult[] = [];
+  let allMapsStats: { team1Stats: PlayerStat[]; team2Stats: PlayerStat[] } | undefined;
 
   // Each game panel has a nav item (for name/score) and a stats table
   $('.vm-stats-game').each((i, gameEl) => {
-    // Skip the "All Maps" summary panel (data-game-id="all")
-    if ($(gameEl).attr('data-game-id') === 'all') return;
+    const gameId = $(gameEl).attr('data-game-id');
+    const isAllMaps = gameId === 'all';
 
     const mapName = normalizeText(
-      $(`.vm-stats-gamesnav-item[data-game-id="${$(gameEl).attr('data-game-id')}"]`)
+      $(`.vm-stats-gamesnav-item[data-game-id="${gameId}"]`)
         .find('div')
         .first()
         .text()
     );
 
-    // Score from the nav item
-    const mapScore = normalizeText(
-      $(`.vm-stats-gamesnav-item[data-game-id="${$(gameEl).attr('data-game-id')}"]`)
+    let mapScore = normalizeText(
+      $(`.vm-stats-gamesnav-item[data-game-id="${gameId}"]`)
         .find('.vm-stats-gamesnav-item-score')
         .text()
     );
+
+    // If no score found in nav, try to extract from table headers or other elements
+    if (!mapScore || !parseScore(mapScore)) {
+      // Try to find score in the game element
+      const scoreInGame = $(gameEl).find('.vm-stats-game-header-score').text();
+      if (scoreInGame) {
+        mapScore = normalizeText(scoreInGame);
+      }
+
+      // Try to parse from team scores in the tables
+      if (!mapScore || !parseScore(mapScore)) {
+        const team1Score = $(gameEl).find('.wf-table-inset.mod-overview').eq(0).find('thead .team-score').text();
+        const team2Score = $(gameEl).find('.wf-table-inset.mod-overview').eq(1).find('thead .team-score').text();
+        if (team1Score && team2Score) {
+          mapScore = `${normalizeText(team1Score)}-${normalizeText(team2Score)}`;
+        }
+      }
+    }
 
     const team1Stats: PlayerStat[] = [];
     const team2Stats: PlayerStat[] = [];
 
     // Two tables per map — first = team1, second = team2
     $(gameEl).find('.wf-table-inset.mod-overview').each((tableIdx, tableEl) => {
+      const headerCells = $(tableEl).find('thead tr').first().find('th');
+      const headers = headerCells.length
+        ? headerCells
+            .map((_, th) => normalizeText($(th).text()))
+            .get()
+        : [];
+      const columns = buildStatColumns(headers);
+
       $(tableEl)
         .find('tbody tr')
         .each((_, row) => {
-          const stat = parsePlayerRow($, row);
+          const stat = parsePlayerRow($, row, columns);
           if (stat.name) {
             if (tableIdx === 0) team1Stats.push(stat);
             else team2Stats.push(stat);
           }
         });
     });
+
+    if (isAllMaps) {
+      allMapsStats = { team1Stats, team2Stats };
+      return;
+    }
 
     if (mapName && mapName !== 'All Maps') {
       maps.push({
@@ -267,7 +428,7 @@ export async function getMatchDetails(matchUrl: string): Promise<MatchDetails | 
     }
   });
 
-  return { team1, team2, score1, score2, status, event, maps };
+  return { team1, team2, score1, score2, status, event, maps, allMapsStats };
 }
 
 // ---------------------------------------------------------------------------
