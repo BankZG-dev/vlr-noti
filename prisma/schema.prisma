@@ -1,0 +1,54 @@
+// prisma/schema.prisma
+
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Stores guild-level config (announcement channel)
+model Guild {
+  id                    String  @id
+  announcementChannelId String?
+}
+
+// Stores every subscription (team / player / region / tournament)
+model UserSubscription {
+  id      String @id @default(cuid())
+  userId  String
+  guildId String
+  type    String // "team" | "player" | "region" | "tournament"
+  name    String // normalized lowercase
+
+  @@unique([userId, guildId, type, name])
+}
+
+// Stores Discord roles created by the bot (so we can look them up and delete them)
+model ManagedRole {
+  id      String @id @default(cuid())
+  guildId String
+  type    String // "team" | "player" | "region" | "tournament"
+  name    String // normalized lowercase — matches UserSubscription.name
+  roleId  String // Discord role snowflake
+
+  @@unique([guildId, type, name])
+}
+
+// Tracks matches we have seen so we know when they go LIVE and when they end
+model TrackedMatch {
+  id          String    @id @default(cuid())      // derived from match URL
+  createdAt   DateTime  @default(now())
+  team1       String    @default("")
+  team2       String    @default("")
+  event       String    @default("")
+  matchUrl    String    @default("")
+  status      String    @default("upcoming")     // "upcoming" | "live" | "final"
+  notifiedLive  Boolean @default(false)
+  notifiedFinal Boolean @default(false)
+  startTime   DateTime  @default(now())
+  updatedAt   DateTime @updatedAt
+  discordMessageId String?
+  discordChannelId String?
+}
