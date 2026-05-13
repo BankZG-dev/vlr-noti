@@ -4,20 +4,32 @@ import { getUpcomingMatches, getMatchDetails } from '../scraper/vlr';
 import { prisma } from '../db';
 import { TrackedMatch } from '@prisma/client';
 import { client } from '../index';
-import { buildLiveEmbed, buildResultEmbed, buildMapStatsEmbeds, buildUpcomingWarningEmbed } from '../../utils/embeds';
+import {
+  buildLiveEmbed,
+  buildResultEmbed,
+  buildMapStatsEmbeds,
+  buildUpcomingWarningEmbedWithTwitch,
+  buildMapUpdateEmbed,
+  TwitchLinks,
+} from '../../utils/embeds';
 import { findRole } from '../../utils/roleHelper';
+import { shouldSend10MinWarning, fetchTwitchLinks, getTimeRemaining } from '../../utils/matchHelper';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Derive a stable ID from a VLR match URL, e.g. "12345" from "/matches/12345/team-a-vs-team-b" */
+/** Derive a stable ID from a VLR match URL, e.g. "12345" from "/666491/..." */
 function matchIdFromUrl(url: string): string {
   const parts = url.replace('https://www.vlr.gg/', '').split('/').filter(Boolean);
-  return parts[1] ?? parts[0] ?? encodeURIComponent(url);
+  return parts[0] ?? encodeURIComponent(url);
 }
 
-/** Collect all Discord role mentions relevant to a match across a guild */
+/**
+ * Collect all Discord role mentions relevant to a match across a guild
+ * WITH deduplication: if a user subscribed to both a team AND a player on that team,
+ * only send one notification
+ */
 async function getRoleMentions(
   guildId: string,
   team1: string,
@@ -25,20 +37,15 @@ async function getRoleMentions(
   event: string,
   matchUrl: string
 ): Promise<string[]> {
-  // Look up all subscriptions that match team names, region, or tournament
-  const subs = await prisma.userSubscription.findMany({
+  const teamSubs = await prisma.userSubscription.findMany({
     where: {
       guildId,
-      OR: [
-        { type: 'team', name: team1.toLowerCase() },
-        { type: 'team', name: team2.toLowerCase() },
-        // Region and tournament subscriptions are broader — we match by
-        // checking if the event string contains the subscription name
-      ],
+      type: 'team',
+      name: { in: [team1.toLowerCase(), team2.toLowerCase()] },
     },
   });
 
-  // Also fetch region + tournament subs and filter in memory
+  // Broader subscriptions (region and tournament)
   const broadSubs = await prisma.userSubscription.findMany({
     where: { guildId, type: { in: ['region', 'tournament'] } },
   });
@@ -48,37 +55,46 @@ async function getRoleMentions(
   );
 
   // Player subscriptions require match detail lookup
-  const playerSubs = await prisma.userSubscription.findMany({
-    where: { guildId, type: 'player' },
-  });
+  let playerSubs: typeof teamSubs = [];
+  const details = await getMatchDetails(matchUrl).catch(() => null);
+  
+  if (details) {
+    const allPlayerSubs = await prisma.userSubscription.findMany({
+      where: { guildId, type: 'player' },
+    });
 
-  const playerMatches: typeof playerSubs = [];
-  if (playerSubs.length > 0) {
-    const details = await getMatchDetails(matchUrl);
-    if (details) {
-      const players = details.maps.flatMap((map) => [
+    const allPlayers = details.maps
+      .flatMap((map) => [
         ...map.team1Stats.map((p) => p.name.toLowerCase()),
         ...map.team2Stats.map((p) => p.name.toLowerCase()),
       ]);
-      for (const sub of playerSubs) {
-        if (players.includes(sub.name.toLowerCase())) {
-          playerMatches.push(sub);
-        }
-      }
+
+    playerSubs = allPlayerSubs.filter((sub) =>
+      allPlayers.includes(sub.name.toLowerCase())
+    );
+  }
+
+  const allSubs = [...teamSubs, ...relevantBroad, ...playerSubs];
+  if (allSubs.length === 0) return [];
+
+  // DEDUPLICATION: Group subscriptions by user+type, then fetch roles
+  // This prevents duplicate pings if a user subscribed to the same match via multiple paths
+  const subsMap = new Map<string, typeof allSubs[0]>();
+  for (const sub of allSubs) {
+    const key = `${sub.userId}:${sub.type}:${sub.name}`;
+    // Keep the first (doesn't matter which since same user+type+name)
+    if (!subsMap.has(key)) {
+      subsMap.has(key) === false && subsMap.set(key, sub);
     }
   }
 
-  const allSubs = [...subs, ...relevantBroad, ...playerMatches];
-  if (allSubs.length === 0) return [];
-
-  // Deduplicate type+name combos and fetch Discord role IDs
-  const seen = new Set<string>();
   const mentions: string[] = [];
+  const seen = new Set<string>();
 
-  for (const sub of allSubs) {
-    const key = `${sub.type}:${sub.name}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
+  for (const sub of subsMap.values()) {
+    const roleKey = `${sub.guildId}:${sub.type}:${sub.name}`;
+    if (seen.has(roleKey)) continue;
+    seen.add(roleKey);
 
     const record = await (prisma as any).managedRole.findUnique({
       where: { guildId_type_name: { guildId, type: sub.type, name: sub.name } },
@@ -156,7 +172,7 @@ async function poll() {
     const isLive = match.status.toUpperCase() === 'LIVE';
 
     // ── Upsert the match into TrackedMatch ──────────────────────────────────
-    const tracked: any = await prisma.trackedMatch.upsert({
+    const tracked = await prisma.trackedMatch.upsert({
       where: { id: matchId },
       update: {
         team1: match.team1,
@@ -164,7 +180,7 @@ async function poll() {
         event: match.event,
         matchUrl: match.url,
         status: isLive ? 'live' : 'upcoming',
-        startTime: new Date(),
+        updatedAt: new Date(),
       },
       create: {
         id: matchId,
@@ -177,49 +193,38 @@ async function poll() {
       },
     });
 
-    // ── 10-minute warning ───────────────────────────────────────────────────
-    // VLR shows match time as e.g. "10:00 PM" — we check if it's ~10 min away
-    // We do a simple approach: if status contains a time string and we haven't
-    // notified yet, check if it's within 10 min of now.
-    // (Full implementation would parse the time; this is a best-effort check.)
-    if (!tracked.notifiedLive && !isLive) {
-      const timeStr = match.time || match.status;
-      if (timeStr && timeStr.match(/\d{1,2}:\d{2}/)) {
-        const now = new Date();
-        // Parse the time (VLR times are in the server's local timezone — approximate)
-        const [hourMin, ampm] = timeStr.split(' ');
-        if (hourMin && ampm) {
-          let [h, m] = hourMin.split(':').map(Number);
-          if (ampm.toUpperCase() === 'PM' && h !== 12) h += 12;
-          if (ampm.toUpperCase() === 'AM' && h === 12) h = 0;
-          const matchTime = new Date();
-          matchTime.setHours(h, m, 0, 0);
-          const diffMs = matchTime.getTime() - now.getTime();
-          const diffMin = diffMs / 60000;
+    // ── 10-minute warning with Twitch links ─────────────────────────────────
+    if (!tracked.notifiedWarning && !isLive && shouldSend10MinWarning(match.time || match.status)) {
+      // Fetch Twitch links
+      const twitchLinks = await fetchTwitchLinks(match.team1, match.team2, match.event);
 
-                  if (diffMin > 0 && diffMin <= 12) {
-            // Send 10-min warning
-            await notifyAllGuilds(
-              matchId,
-              match.team1,
-              match.team2,
-              match.event,
-              match.url,
-              (mentions) => ({
-                content: mentions.join(' '),
-                embeds: [buildUpcomingWarningEmbed(match)],
-              })
-            );
-          }
-        }
-      }
+      await prisma.trackedMatch.update({
+        where: { id: matchId },
+        data: {
+          notifiedWarning: true,
+          twitchLinks: JSON.stringify(twitchLinks),
+        },
+      });
+
+      await notifyAllGuilds(
+        matchId,
+        match.team1,
+        match.team2,
+        match.event,
+        match.url,
+        (mentions) => ({
+          content: mentions.join(' '),
+          embeds: [buildUpcomingWarningEmbedWithTwitch(match, twitchLinks)],
+        })
+      );
+      console.log(`[polling] Sent 10-minute warning for ${match.team1} vs ${match.team2}`);
     }
 
     // ── LIVE notification ───────────────────────────────────────────────────
     if (isLive && !tracked.notifiedLive) {
       await prisma.trackedMatch.update({
         where: { id: matchId },
-        data: { status: 'live', notifiedLive: true },
+        data: { status: 'live', notifiedLive: true, lastMapUpdateTime: new Date() },
       });
 
       await notifyAllGuilds(
@@ -233,6 +238,72 @@ async function poll() {
           embeds: [buildLiveEmbed(match)],
         })
       );
+      console.log(`[polling] Sent LIVE notification for ${match.team1} vs ${match.team2}`);
+    }
+
+    // ── LIVE map updates (every 2 minutes, but throttle to every 5+ min per match) ──
+    if (isLive && tracked.status === 'live') {
+      const lastUpdate = tracked.lastMapUpdateTime ? new Date(tracked.lastMapUpdateTime) : new Date(0);
+      const timeSinceUpdate = Date.now() - lastUpdate.getTime();
+      const THROTTLE_MS = 5 * 60 * 1000; // 5 minutes
+
+      if (timeSinceUpdate >= THROTTLE_MS) {
+        try {
+          const details = await getMatchDetails(match.url);
+          if (details && details.maps.length > 0) {
+            // Build current scores
+            const currentScores = details.maps.map((map, idx) => ({
+              mapNum: idx + 1,
+              team1Score: map.team1Score,
+              team2Score: map.team2Score,
+            }));
+
+            // Get last known scores from database
+            let lastScores: typeof currentScores = [];
+            if (tracked.lastMapScores) {
+              try {
+                lastScores = JSON.parse(tracked.lastMapScores);
+              } catch (err) {
+                console.warn('[polling] Failed to parse lastMapScores:', err);
+              }
+            }
+
+            // Check if scores have changed
+            const scoresChanged =
+              lastScores.length !== currentScores.length ||
+              lastScores.some((last, idx) => {
+                const current = currentScores[idx];
+                return last.team1Score !== current.team1Score || last.team2Score !== current.team2Score;
+              });
+
+            // Only send update if scores changed AND throttle time passed
+            if (scoresChanged) {
+              await prisma.trackedMatch.update({
+                where: { id: matchId },
+                data: {
+                  lastMapUpdateTime: new Date(),
+                  lastMapScores: JSON.stringify(currentScores),
+                },
+              });
+
+              await notifyAllGuilds(
+                matchId,
+                match.team1,
+                match.team2,
+                match.event,
+                match.url,
+                (mentions) => ({
+                  content: mentions.join(' '),
+                  embeds: [buildMapUpdateEmbed(details.team1, details.team2, details.maps)],
+                })
+              );
+              console.log(`[polling] Sent map update for ${match.team1} vs ${match.team2}`);
+            }
+          }
+        } catch (err) {
+          console.error(`[polling] Error fetching live updates for ${match.url}:`, err);
+        }
+      }
     }
   }
 
@@ -247,33 +318,83 @@ async function poll() {
   );
 
   for (const tracked of liveTracked) {
-    if (!liveUrls.has((tracked as any).matchUrl)) {
+    if (!liveUrls.has(tracked.matchUrl)) {
       // Match has ended — scrape the final details
-      const details = await getMatchDetails((tracked as any).matchUrl);
+      try {
+        const details = await getMatchDetails(tracked.matchUrl);
+
+        await prisma.trackedMatch.update({
+          where: { id: tracked.id },
+          data: { status: 'final', notifiedFinal: true },
+        });
+
+        if (!details) continue;
+
+        const mapStatsEmbeds = buildMapStatsEmbeds(details);
+        const threadName = `${details.team1} ${details.score1}–${details.score2} ${details.team2} — Map Stats`;
+
+        await notifyAllGuilds(
+          tracked.id,
+          tracked.team1,
+          tracked.team2,
+          tracked.event,
+          tracked.matchUrl,
+          (mentions) => ({
+            content: mentions.join(' '),
+            embeds: [buildResultEmbed(details, tracked.matchUrl)],
+            threadEmbeds: mapStatsEmbeds,
+            threadName,
+          })
+        );
+        console.log(`[polling] Sent FINAL result for ${tracked.team1} vs ${tracked.team2}`);
+      } catch (err) {
+        console.error(`[polling] Error processing final match ${tracked.matchUrl}:`, err);
+      }
+    }
+  }
+
+  // ── PERSISTENCE: Check for matches that were supposed to notify but bot was offline
+  // These are matches that are no longer LIVE but notifiedFinal is still false
+  const missedFinal = await prisma.trackedMatch.findMany({
+    where: {
+      status: { not: 'upcoming' },
+      notifiedFinal: false,
+      notifiedLive: true,
+      createdAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) }, // Last 7 days
+    },
+  });
+
+  for (const tracked of missedFinal) {
+    try {
+      console.log(`[polling] Checking missed match ${tracked.team1} vs ${tracked.team2}`);
+      const details = await getMatchDetails(tracked.matchUrl);
+
+      if (!details) continue;
 
       await prisma.trackedMatch.update({
         where: { id: tracked.id },
         data: { status: 'final', notifiedFinal: true },
       });
 
-      if (!details) continue;
-
       const mapStatsEmbeds = buildMapStatsEmbeds(details);
-      const threadName = `${details.team1} ${details.score1}–${details.score2} ${details.team2} — Map Stats`;
+      const threadName = `${details.team1} ${details.score1}–${details.score2} ${details.team2} — Map Stats (Backfill)`;
 
       await notifyAllGuilds(
         tracked.id,
-        (tracked as any).team1,
-        (tracked as any).team2,
-        (tracked as any).event,
-        (tracked as any).matchUrl,
+        tracked.team1,
+        tracked.team2,
+        tracked.event,
+        tracked.matchUrl,
         (mentions) => ({
-          content: mentions.join(' '),
-          embeds: [buildResultEmbed(details, (tracked as any).matchUrl)],
+          content: mentions.length > 0 ? `⚠️ **Match Result (Posted Late)** ${mentions.join(' ')}` : '⚠️ **Match Result (Posted Late)**',
+          embeds: [buildResultEmbed(details, tracked.matchUrl)],
           threadEmbeds: mapStatsEmbeds,
           threadName,
         })
       );
+      console.log(`[polling] Sent BACKFILL result for ${tracked.team1} vs ${tracked.team2}`);
+    } catch (err) {
+      console.error(`[polling] Error in persistence check for ${tracked.matchUrl}:`, err);
     }
   }
 }

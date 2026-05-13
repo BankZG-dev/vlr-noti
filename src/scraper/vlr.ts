@@ -216,7 +216,35 @@ function getCellValue(cell: cheerio.Cheerio<Element>): string {
 }
 
 function getCellText(cell: cheerio.Cheerio<Element>): string {
-  return normalizeText(cell.text());
+  // Try to get value from nested .side span first
+  const sideSpan = cell.find('.side').first();
+  if (sideSpan.length > 0) {
+    const text = normalizeText(sideSpan.text());
+    if (text && text !== '/' && !text.includes('\n')) {
+      return text;
+    }
+  }
+  
+  // Get first line of cell text (before newlines and whitespace)
+  const cellText = cell.text();
+  const firstLine = cellText.split('\n')[0].trim();
+  return normalizeText(firstLine);
+}
+
+// Extract value from nested .side.mod-both span (for K/D/A stats)
+function extractModBothValue(cell: cheerio.Cheerio<Element>): string {
+  const modBothSpan = cell.find('.side.mod-both, .side.mod-side.mod-both').first();
+  if (modBothSpan.length > 0) {
+    return normalizeText(modBothSpan.text());
+  }
+  // Fallback to first span with class "side"
+  const sideSpan = cell.find('.side').first();
+  if (sideSpan.length > 0) {
+    return normalizeText(sideSpan.text());
+  }
+  // Fallback to first line of cell text
+  const text = cell.text().split('\n')[0].trim();
+  return normalizeText(text);
 }
 
 function parseScore(value: string): [number, number] | null {
@@ -251,22 +279,35 @@ function findHeaderIndex(headers: string[], patterns: RegExp[]): number | undefi
 }
 
 function buildStatColumns(headers: string[]): StatColumns {
-  // VLR stat table columns in order: R | ACS | K | D | A | +/– | KAST | ADR | HS% | FK | FD | +/–
-  // Player name is in row text, agent is in img
+  // VLR table columns with headers:
+  // [0]: '' (Player name - no header)
+  // [1]: '' (Agent - no header)  
+  // [2]: 'R' (Rating)
+  // [3]: 'ACS' (Average Combat Score)
+  // [4]: 'K' (Kills)
+  // [5]: 'D' (Deaths - but shows "/" due to HTML structure)
+  // [6]: 'A' (Assists)
+  // [7]: '+/–' (Plus/Minus)
+  // [8]: 'KAST'
+  // [9]: 'ADR'  
+  // [10]: 'HS%' (Headshot percentage)
+  // [11]: 'FK' (First Kills)
+  // [12]: 'FD' (First Deaths)
+  // [13]: '+/–' (Plus/Minus repeat)
   return {
-    player: -1, // Extracted from row text
-    agent: -1,  // Extracted from img
-    rating: 0,  // R
-    acs: 1,     // ACS
+    player: -1, // Extracted from row text (column 0)
+    agent: -1,  // Extracted from img (column 1)
+    rating: 2,  // R
+    acs: 3,     // ACS
     kda: -1,    // Computed from K/D/A
-    kills: 2,   // K
-    deaths: 3,  // D
-    assists: 4, // A
-    adr: 7,     // ADR
-    hsPercent: 8, // HS%
-    fk: 9,      // FK
-    fd: 10,     // FD
-    plusMinus: 5, // +/– first occurrence
+    kills: 4,   // K
+    deaths: 5,  // D
+    assists: 6, // A
+    adr: 9,     // ADR
+    hsPercent: 10, // HS%
+    fk: 11,     // FK
+    fd: 12,     // FD
+    plusMinus: 7, // +/–
   };
 }
 
@@ -287,7 +328,22 @@ function parsePlayerRow(
     }
   } else {
     // Player name might be in the row header or first cell
-    playerName = normalizeText($(el).find('th').text()) || normalizeText(cells.eq(0).text());
+    let nameText = normalizeText($(el).find('th').text());
+    if (!nameText) {
+      nameText = normalizeText(cells.eq(0).text());
+    }
+    // Get first line only (before newlines)
+    playerName = nameText.split('\n')[0].trim();
+  }
+  
+  // Remove team name suffix if present (e.g., "Meteor T1" -> "Meteor")
+  // Player names are followed by optional team abbreviation separated by space
+  const teamAbbreviations = ['T1', 'FNC', 'G2', 'GIA', 'SEN', 'NRG', 'FS', 'FULL SENSE', 'EG', 'KOI', 'NAVI', 'LEV'];
+  for (const team of teamAbbreviations) {
+    if (playerName.endsWith(` ${team}`)) {
+      playerName = playerName.substring(0, playerName.length - team.length - 1).trim();
+      break;
+    }
   }
 
   // Get agent
@@ -302,13 +358,13 @@ function parsePlayerRow(
   // Extract stats using column mapping
   const rating = columns.rating >= 0 ? getCellText(cells.eq(columns.rating)) : '0';
   const acs = columns.acs >= 0 ? getCellText(cells.eq(columns.acs)) : '0';
-  const kills = columns.kills >= 0 ? getCellText(cells.eq(columns.kills)) : '0';
-  const deaths = columns.deaths >= 0 ? getCellText(cells.eq(columns.deaths)) : '0';
-  const assists = columns.assists >= 0 ? getCellText(cells.eq(columns.assists)) : '0';
+  const kills = columns.kills >= 0 ? extractModBothValue(cells.eq(columns.kills)) : '0';
+  const deaths = columns.deaths >= 0 ? extractModBothValue(cells.eq(columns.deaths)) : '0';
+  const assists = columns.assists >= 0 ? extractModBothValue(cells.eq(columns.assists)) : '0';
   const adr = columns.adr >= 0 ? getCellText(cells.eq(columns.adr)) : '0';
   const hsPercent = columns.hsPercent >= 0 ? getCellText(cells.eq(columns.hsPercent)) : '0';
-  const fk = columns.fk >= 0 ? getCellText(cells.eq(columns.fk)) : '0';
-  const fd = columns.fd >= 0 ? getCellText(cells.eq(columns.fd)) : '0';
+  const fk = columns.fk >= 0 ? extractModBothValue(cells.eq(columns.fk)) : '0';
+  const fd = columns.fd >= 0 ? extractModBothValue(cells.eq(columns.fd)) : '0';
   const plusMinus = columns.plusMinus >= 0 ? getCellText(cells.eq(columns.plusMinus)) : '';
 
   const kda = `${kills}/${deaths}/${assists}`;
@@ -338,12 +394,11 @@ export async function getMatchDetails(matchUrl: string): Promise<MatchDetails | 
   const team1 = normalizeText($('.match-header-link-name').eq(0).text());
   const team2 = normalizeText($('.match-header-link-name').eq(1).text());
 
-  // Series score — the two non-separator spans inside .js-spoiler
-  const scoreSpans = $('.match-header-vs-score .js-spoiler span').filter(
-    (_, el) => !$(el).hasClass('match-header-vs-score-colon')
-  );
-  const score1 = normalizeText(scoreSpans.eq(0).text());
-  const score2 = normalizeText(scoreSpans.eq(1).text());
+  // Series score — get all spans and filter out the ":" separator
+  const allScoreSpans = $('.match-header-vs-score .js-spoiler span').map((_, el) => normalizeText($(el).text())).get();
+  const scoreValues = allScoreSpans.filter((text) => text !== ':' && text !== '');
+  const score1 = scoreValues[0] || '';
+  const score2 = scoreValues[1] || '';
 
   const status = normalizeText($('.match-header-vs-note').eq(1).text()) ||
                  normalizeText($('.match-header-vs-note').first().text());
@@ -358,33 +413,58 @@ export async function getMatchDetails(matchUrl: string): Promise<MatchDetails | 
     const gameId = $(gameEl).attr('data-game-id');
     const isAllMaps = gameId === 'all';
 
-    const mapName = normalizeText(
-      $(`.vm-stats-gamesnav-item[data-game-id="${gameId}"]`)
-        .find('div')
-        .first()
-        .text()
-    );
+    // Extract map name from the tab - it appears as "1\nPearl" or "2\nLotus"
+    let mapName = '';
+    if (!isAllMaps) {
+      const tabText = normalizeText(
+        $(`.vm-stats-gamesnav-item[data-game-id="${gameId}"]`).text()
+      );
+      // Extract just the map name (e.g., "Pearl" from "1 Pearl")
+      const match = tabText.match(/\d+\s+(.+)/);
+      if (match && match[1]) {
+        mapName = match[1].trim();
+      }
+    }
 
-    let mapScore = normalizeText(
-      $(`.vm-stats-gamesnav-item[data-game-id="${gameId}"]`)
-        .find('.vm-stats-gamesnav-item-score')
-        .text()
-    );
+    let mapScore = '';
+    // Try to get score from .score divs (T1 score and opponent score)
+    const scoreElements = $(gameEl).find('.score');
+    if (scoreElements.length >= 2) {
+      const team1Score = normalizeText(scoreElements.eq(0).text());
+      const team2Score = normalizeText(scoreElements.eq(scoreElements.length - 1).text());
+      if (team1Score && team2Score) {
+        mapScore = `${team1Score}-${team2Score}`;
+      }
+    }
+    
+    // Fallback: try to get score from the tab
+    if (!mapScore) {
+      const tabScore = normalizeText(
+        $(`.vm-stats-gamesnav-item[data-game-id="${gameId}"]`)
+          .find('.vm-stats-gamesnav-item-score')
+          .text()
+      );
+      if (tabScore && parseScore(tabScore)) {
+        mapScore = tabScore;
+      }
+    }
 
-    // If no score found in nav, try to extract from table headers or other elements
+    // Fallback: try other locations
     if (!mapScore || !parseScore(mapScore)) {
       // Try to find score in the game element
-      const scoreInGame = $(gameEl).find('.vm-stats-game-header-score').text();
-      if (scoreInGame) {
-        mapScore = normalizeText(scoreInGame);
+      const scoreInGame = normalizeText($(gameEl).find('.vm-stats-game-header-score').text());
+      if (scoreInGame && parseScore(scoreInGame)) {
+        mapScore = scoreInGame;
       }
 
       // Try to parse from team scores in the tables
       if (!mapScore || !parseScore(mapScore)) {
-        const team1Score = $(gameEl).find('.wf-table-inset.mod-overview').eq(0).find('thead .team-score').text();
-        const team2Score = $(gameEl).find('.wf-table-inset.mod-overview').eq(1).find('thead .team-score').text();
+        const team1ScoreEl = $(gameEl).find('.wf-table-inset.mod-overview').eq(0).find('thead .team-score');
+        const team2ScoreEl = $(gameEl).find('.wf-table-inset.mod-overview').eq(1).find('thead .team-score');
+        const team1Score = normalizeText(team1ScoreEl.text());
+        const team2Score = normalizeText(team2ScoreEl.text());
         if (team1Score && team2Score) {
-          mapScore = `${normalizeText(team1Score)}-${normalizeText(team2Score)}`;
+          mapScore = `${team1Score}-${team2Score}`;
         }
       }
     }

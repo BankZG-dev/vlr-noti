@@ -363,3 +363,66 @@ export function buildUpcomingEmbed(team: string, matches: MatchSummary[]): Embed
     .setDescription(lines.join('\n\n') || '_No upcoming matches found_')
     .setFooter({ text: 'vlr.gg' });
 }
+
+// ---------------------------------------------------------------------------
+// Live map updates embed (during match)
+// ---------------------------------------------------------------------------
+export function buildMapUpdateEmbed(team1: string, team2: string, maps: MapResult[]): EmbedBuilder {
+  const mapLines = maps
+    .map((m) => {
+      const scoreParts = parseScore(m.score);
+      if (!scoreParts) return `**${m.name}**: ${m.score}`;
+      const [score1, score2] = scoreParts;
+      const indicator = score1 > score2 ? `${team1} 🟢` : score2 > score1 ? `${team2} 🟢` : '⚪';
+      return `**${m.name}**: ${score1}-${score2} (${indicator})`;
+    })
+    .join('\n');
+
+  return new EmbedBuilder()
+    .setColor(0xfaa61a)
+    .setTitle(`🔴 LIVE: Current Map Scores`)
+    .setDescription(mapLines || 'No maps started yet')
+    .setFooter({ text: 'Updates every 2 minutes' });
+}
+
+// ---------------------------------------------------------------------------
+// Upcoming warning with Twitch links
+// ---------------------------------------------------------------------------
+export interface TwitchLinks {
+  pacific?: string;
+  na?: string;
+  eu?: string;
+  cn?: string;
+  champions?: string;
+}
+
+export function buildUpcomingWarningEmbedWithTwitch(
+  match: MatchSummary,
+  twitchLinks?: TwitchLinks
+): EmbedBuilder {
+  const embed = new EmbedBuilder()
+    .setColor(0xfaa61a)
+    .setTitle(`⏰ Match Starting Soon: ${match.team1} vs ${match.team2}`)
+    .setURL(match.url)
+    .setDescription(`**${match.event}**\nStarting in approximately 10 minutes.`);
+
+  if (twitchLinks && Object.keys(twitchLinks).length > 0) {
+    const twitchLines = Object.entries(twitchLinks)
+      .filter(([_, url]) => url)
+      .map(([region, url]) => {
+        const regionName = region.charAt(0).toUpperCase() + region.slice(1);
+        return `[📺 ${regionName}](${url})`;
+      });
+    
+    if (twitchLines.length > 0) {
+      embed.addFields({
+        name: 'Watch on Twitch',
+        value: twitchLines.join(' | '),
+        inline: false
+      });
+    }
+  }
+
+  embed.setFooter({ text: 'vlr.gg' });
+  return embed;
+}

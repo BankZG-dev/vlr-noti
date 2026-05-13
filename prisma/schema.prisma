@@ -2,6 +2,7 @@
 
 datasource db {
   provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 generator client {
@@ -45,10 +46,21 @@ model TrackedMatch {
   event       String    @default("")
   matchUrl    String    @default("")
   status      String    @default("upcoming")     // "upcoming" | "live" | "final"
+  notifiedWarning Boolean @default(false)        // 10-minute warning sent
   notifiedLive  Boolean @default(false)
   notifiedFinal Boolean @default(false)
   startTime   DateTime  @default(now())
   updatedAt   DateTime @updatedAt
   discordMessageId String?
   discordChannelId String?
+  
+  // Twitch links for all regions (stored as JSON: { pacific: "url", na: "url", eu: "url", cn: "url", champions: "url" })
+  twitchLinks String?
+  
+  // Track when we last sent map updates to avoid spamming
+  lastMapUpdateTime DateTime?
+  
+  // Store last known map scores to only send updates when scores change
+  // Format: JSON string storing array of { mapNum, team1Score, team2Score }
+  lastMapScores String?
 }

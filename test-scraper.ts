@@ -2,7 +2,7 @@ import { getMatchDetails } from './src/scraper/vlr';
 
 async function test() {
   console.log('Fetching match details...');
-  const details = await getMatchDetails('https://www.vlr.gg/match/666491/t1-vs-full-sense-vct-2026-pacific-stage-1-ubsf');
+  const details = await getMatchDetails('https://www.vlr.gg/666491/t1-vs-full-sense-vct-2026-pacific-stage-1-ubsf');
   if (details) {
     console.log('Team 1:', details.team1);
     console.log('Team 2:', details.team2);
