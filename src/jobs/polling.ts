@@ -251,12 +251,15 @@ async function poll() {
         try {
           const details = await getMatchDetails(match.url);
           if (details && details.maps.length > 0) {
-            // Build current scores
-            const currentScores = details.maps.map((map, idx) => ({
-              mapNum: idx + 1,
-              team1Score: map.team1Score,
-              team2Score: map.team2Score,
-            }));
+            // Build current scores from the score string (e.g. "13-7")
+            const currentScores = details.maps.map((map, idx) => {
+              const [t1, t2] = map.score.split('-').map(s => parseInt(s.trim(), 10) || 0);
+              return {
+                mapNum: idx + 1,
+                team1Score: t1,
+                team2Score: t2,
+              };
+            });
 
             // Get last known scores from database
             let lastScores: typeof currentScores = [];
